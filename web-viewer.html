@@ -77,15 +77,16 @@
   <button id="btn-leave" class="ghost">Disconnect</button>
 </div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/livekit-client@2.22.3/dist/livekit-client.umd.js"></script>
 <script>
 (function() {
   'use strict';
+  var TOKEN_WORKER_URL = 'https://p2p-token.sieyes-dev.workers.dev/token';
   var $ = function(id) { return document.getElementById(id); };
   var overlay = $('overlay'), status = $('status'), video = $('video');
   var codeInput = $('code-input'), btnConnect = $('btn-connect');
   var controls = $('controls'), unmuteBanner = $('unmute-banner');
-  var peer = null, call = null, muted = false, hideTimer = null;
+  var room = null, audioEl = null, muted = false, hideTimer = null, gotVideo = false;
 
   function setStatus(msg, kind) {
     status.textContent = msg || '';
@@ -116,77 +117,85 @@
   });
 
   function teardown() {
-    if (call) { try { call.close(); } catch (e) {} call = null; }
-    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    if (room) { try { room.disconnect(); } catch (e) {} room = null; }
+    if (audioEl) { audioEl.remove(); audioEl = null; }
     video.srcObject = null;
+    gotVideo = false;
     overlay.classList.remove('hidden');
     controls.classList.remove('show');
     unmuteBanner.style.display = 'none';
     btnConnect.disabled = false;
   }
 
-  function connect(code) {
-    if (peer) return;
-    setStatus('Connecting to signaling…');
-    btnConnect.disabled = true;
-    peer = new Peer(); // random viewer ID
-
-    peer.on('open', function() {
-      setStatus('Dialing host ' + code + '…');
-      try {
-        call = peer.call(code, new MediaStream(), {
-          constraints: { offerToReceiveVideo: true, offerToReceiveAudio: true }
+  function attachTrack(track) {
+    if (track.kind === LivekitClient.Track.Kind.Video) {
+      track.attach(video);
+      video.muted = false;
+      var p = video.play();
+      if (p && typeof p.catch === 'function') {
+        p.catch(function() {
+          // Autoplay blocked — show unmute banner (common in embedded browsers like SL)
+          unmuteBanner.style.display = 'block';
+          video.muted = true;
+          video.play().catch(function(){});
         });
-      } catch (e) {
-        setStatus('Could not place call: ' + (e.message || e), 'err');
-        teardown();
-        return;
       }
+      gotVideo = true;
+      overlay.classList.add('hidden');
+      setStatus('');
+      showControls();
+    } else if (track.kind === LivekitClient.Track.Kind.Audio) {
+      if (!audioEl) {
+        audioEl = document.createElement('audio');
+        audioEl.autoplay = true;
+        document.body.appendChild(audioEl);
+      }
+      track.attach(audioEl);
+    }
+  }
 
-      call.on('stream', function(remoteStream) {
-        video.srcObject = remoteStream;
-        video.muted = false;
-        var p = video.play();
-        if (p && typeof p.catch === 'function') {
-          p.catch(function() {
-            // Autoplay blocked — show unmute banner (common in embedded browsers like SL)
-            unmuteBanner.style.display = 'block';
-            video.muted = true;
-            video.play().catch(function(){});
-          });
-        }
-        overlay.classList.add('hidden');
-        setStatus('');
-        showControls();
-      });
+  async function connect(code) {
+    if (room) return;
+    var roomName = code.toLowerCase();
+    setStatus('Connecting to relay…');
+    btnConnect.disabled = true;
 
-      call.on('close', function() {
+    var r = new LivekitClient.Room({ adaptiveStream: true });
+    room = r;
+
+    r.on(LivekitClient.RoomEvent.TrackSubscribed, function(track) { attachTrack(track); });
+    r.on(LivekitClient.RoomEvent.Disconnected, function() {
+      if (room === r) { setStatus('Disconnected from relay.', 'warn'); teardown(); }
+    });
+    r.on(LivekitClient.RoomEvent.ParticipantDisconnected, function() {
+      if (room === r && r.remoteParticipants.size === 0 && gotVideo) {
         setStatus('Host ended the stream.', 'warn');
         teardown();
-      });
-      call.on('error', function(e) {
-        setStatus('Stream error: ' + ((e && e.message) || e), 'err');
-        teardown();
-      });
-
-      setTimeout(function() {
-        if (call && !video.srcObject) {
-          setStatus('No video yet — host may be unreachable or behind a strict firewall.', 'warn');
-        }
-      }, 20000);
-    });
-
-    peer.on('error', function(err) {
-      var type = err && err.type;
-      if (type === 'peer-unavailable') {
-        setStatus('No host found for that code. Check the code and try again.', 'err');
-      } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
-        setStatus('Signaling issue (' + type + '). Check internet and retry.', 'err');
-      } else {
-        setStatus('Connection error: ' + type, 'err');
       }
-      teardown();
     });
+
+    try {
+      var tr = await fetch(TOKEN_WORKER_URL + '?room=' + encodeURIComponent(roomName) +
+        '&name=viewer&role=viewer');
+      if (!tr.ok) throw new Error('token server returned ' + tr.status);
+      var j = await tr.json();
+      if (!j.token || !j.url) throw new Error('bad token response');
+      if (room !== r) return;
+      await r.connect(j.url, j.token);
+      // Attach tracks published before we joined.
+      r.remoteParticipants.forEach(function(p) {
+        p.trackPublications.forEach(function(pub) { if (pub.track) attachTrack(pub.track); });
+      });
+      if (!gotVideo) setStatus('Connected — waiting for host video…');
+      setTimeout(function() {
+        if (room === r && !gotVideo) {
+          setStatus('No video yet — the host may not be live. Check the code.', 'warn');
+        }
+      }, 15000);
+    } catch (e) {
+      setStatus('Connection failed: ' + (e.message || e), 'err');
+      teardown();
+    }
   }
 
   btnConnect.addEventListener('click', function() {
@@ -200,6 +209,7 @@
 
   unmuteBanner.addEventListener('click', function() {
     video.muted = false;
+    if (audioEl) audioEl.muted = false;
     video.play().catch(function(){});
     unmuteBanner.style.display = 'none';
   });
@@ -207,6 +217,7 @@
   $('btn-mute').addEventListener('click', function() {
     muted = !muted;
     video.muted = muted;
+    if (audioEl) audioEl.muted = muted;
     this.textContent = muted ? '🔇 Unmute' : '🔊 Mute';
     showControls();
   });
