@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P2P Viewer — Web Watch</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #0a0a0f; color: #e8e8f0; font-family: 'Segoe UI', system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+  #video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: rgba(10,10,15,0.92); z-index: 10; transition: opacity 0.4s;
+    padding: 24px; text-align: center;
+  }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+  h1 { font-size: 28px; font-weight: 600; letter-spacing: 1px; }
+  h1 span { color: #5af; }
+  p.sub { color: #8888a0; font-size: 14px; max-width: 420px; line-height: 1.5; }
+  #code-row { display: flex; gap: 10px; align-items: center; }
+  #code-input {
+    font-size: 22px; padding: 12px 16px; width: 220px; text-align: center;
+    background: #16161f; border: 2px solid #33334a; border-radius: 10px;
+    color: #fff; letter-spacing: 2px; text-transform: uppercase; outline: none;
+  }
+  #code-input:focus { border-color: #5af; }
+  button {
+    font-size: 18px; padding: 12px 28px; border: none; border-radius: 10px;
+    background: #2a6af0; color: #fff; cursor: pointer; font-weight: 600;
+  }
+  button:hover { background: #3a7af5; }
+  button:disabled { background: #33334a; cursor: default; }
+  button.ghost { background: transparent; border: 1px solid #44445a; font-size: 14px; padding: 8px 18px; }
+  #status { font-size: 14px; color: #8888a0; min-height: 20px; }
+  #status.ok { color: #4d4; }
+  #status.err { color: #f66; }
+  #status.warn { color: #fc6; }
+  #controls {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 5;
+    display: flex; justify-content: center; gap: 10px; padding: 12px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.7));
+    opacity: 0; transition: opacity 0.3s;
+  }
+  #controls.show { opacity: 1; }
+  #controls button { font-size: 14px; padding: 8px 16px; }
+  #unmute-banner {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    background: #2a6af0; padding: 10px 22px; border-radius: 24px;
+    font-size: 15px; cursor: pointer; z-index: 20; display: none;
+    box-shadow: 0 4px 18px rgba(42,106,240,0.5);
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline></video>
+</div>
+
+<div id="overlay">
+  <h1>P2P <span>VIEWER</span></h1>
+  <p class="sub">Enter the host's 6-character code to watch their screen.<br>
+  Tip: add <code>?code=PV-XXXXXX</code> to this page's URL to pre-fill it — handy for Second Life shared media.</p>
+  <div id="code-row">
+    <input id="code-input" maxlength="9" placeholder="PV-XXXXXX" autocomplete="off" spellcheck="false">
+    <button id="btn-connect">Connect</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<div id="unmute-banner">🔊 Click to enable sound</div>
+
+<div id="controls">
+  <button id="btn-mute" class="ghost">🔊 Mute</button>
+  <button id="btn-full" class="ghost">⛶ Fullscreen</button>
+  <button id="btn-leave" class="ghost">Disconnect</button>
+</div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(function() {
+  'use strict';
+  var $ = function(id) { return document.getElementById(id); };
+  var overlay = $('overlay'), status = $('status'), video = $('video');
+  var codeInput = $('code-input'), btnConnect = $('btn-connect');
+  var controls = $('controls'), unmuteBanner = $('unmute-banner');
+  var peer = null, call = null, muted = false, hideTimer = null;
+
+  function setStatus(msg, kind) {
+    status.textContent = msg || '';
+    status.className = kind || '';
+  }
+
+  function normalizeCode(raw) {
+    var code = String(raw || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (code && !code.startsWith('PV-')) code = 'PV-' + code;
+    return code;
+  }
+
+  // Pre-fill from ?code= param
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var preset = normalizeCode(params.get('code'));
+    if (preset) codeInput.value = preset;
+  } catch (e) {}
+
+  function showControls() {
+    controls.classList.add('show');
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function() { controls.classList.remove('show'); }, 3000);
+  }
+  document.addEventListener('mousemove', function() {
+    if (!overlay.classList.contains('hidden')) return;
+    showControls();
+  });
+
+  function teardown() {
+    if (call) { try { call.close(); } catch (e) {} call = null; }
+    if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+    video.srcObject = null;
+    overlay.classList.remove('hidden');
+    controls.classList.remove('show');
+    unmuteBanner.style.display = 'none';
+    btnConnect.disabled = false;
+  }
+
+  function connect(code) {
+    if (peer) return;
+    setStatus('Connecting to signaling…');
+    btnConnect.disabled = true;
+    peer = new Peer(); // random viewer ID
+
+    peer.on('open', function() {
+      setStatus('Dialing host ' + code + '…');
+      try {
+        call = peer.call(code, new MediaStream(), {
+          constraints: { offerToReceiveVideo: true, offerToReceiveAudio: true }
+        });
+      } catch (e) {
+        setStatus('Could not place call: ' + (e.message || e), 'err');
+        teardown();
+        return;
+      }
+
+      call.on('stream', function(remoteStream) {
+        video.srcObject = remoteStream;
+        video.muted = false;
+        var p = video.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(function() {
+            // Autoplay blocked — show unmute banner (common in embedded browsers like SL)
+            unmuteBanner.style.display = 'block';
+            video.muted = true;
+            video.play().catch(function(){});
+          });
+        }
+        overlay.classList.add('hidden');
+        setStatus('');
+        showControls();
+      });
+
+      call.on('close', function() {
+        setStatus('Host ended the stream.', 'warn');
+        teardown();
+      });
+      call.on('error', function(e) {
+        setStatus('Stream error: ' + ((e && e.message) || e), 'err');
+        teardown();
+      });
+
+      setTimeout(function() {
+        if (call && !video.srcObject) {
+          setStatus('No video yet — host may be unreachable or behind a strict firewall.', 'warn');
+        }
+      }, 20000);
+    });
+
+    peer.on('error', function(err) {
+      var type = err && err.type;
+      if (type === 'peer-unavailable') {
+        setStatus('No host found for that code. Check the code and try again.', 'err');
+      } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
+        setStatus('Signaling issue (' + type + '). Check internet and retry.', 'err');
+      } else {
+        setStatus('Connection error: ' + type, 'err');
+      }
+      teardown();
+    });
+  }
+
+  btnConnect.addEventListener('click', function() {
+    var code = normalizeCode(codeInput.value);
+    if (code.length < 6) { setStatus('Enter the host code first.', 'warn'); return; }
+    connect(code);
+  });
+  codeInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') btnConnect.click();
+  });
+
+  unmuteBanner.addEventListener('click', function() {
+    video.muted = false;
+    video.play().catch(function(){});
+    unmuteBanner.style.display = 'none';
+  });
+
+  $('btn-mute').addEventListener('click', function() {
+    muted = !muted;
+    video.muted = muted;
+    this.textContent = muted ? '🔇 Unmute' : '🔊 Mute';
+    showControls();
+  });
+  $('btn-full').addEventListener('click', function() {
+    var el = document.documentElement;
+    if (document.fullscreenElement) { document.exitFullscreen().catch(function(){}); }
+    else if (el.requestFullscreen) { el.requestFullscreen().catch(function(){}); }
+    showControls();
+  });
+  $('btn-leave').addEventListener('click', function() {
+    teardown();
+    setStatus('Disconnected.');
+  });
+})();
+</script>
+</body>
+</html>
